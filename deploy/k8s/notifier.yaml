@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-health-notifier
+  namespace: k8s-health
+  labels: {app: k8s-health-notifier}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: k8s-health-notifier}
+  template:
+    metadata:
+      labels: {app: k8s-health-notifier}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: notifier
+          image: k8s-health-notifier:1.1.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: PORT, value: "8080"}
+            - {name: DISCORD_USERNAME, value: "K8s Health Checker"}
+            - {name: DISCORD_MENTION_ON_CRITICAL, value: ""}
+            - {name: LOG_LEVEL, value: INFO}
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom: {secretKeyRef: {name: k8s-health-secrets, key: DISCORD_WEBHOOK_URL}}
+            - name: WEBHOOK_AUTH_TOKEN
+              valueFrom: {secretKeyRef: {name: k8s-health-secrets, key: WEBHOOK_AUTH_TOKEN}}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 96Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-health-notifier
+  namespace: k8s-health
+spec:
+  selector: {app: k8s-health-notifier}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

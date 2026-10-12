@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k8s-health
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - notifier.yaml
+  - checker.yaml
+# Secret k8s-health-secrets dibuat terpisah (lihat secret.example.yaml / README)
+
+# Ganti dengan registry Anda setelah push image
+images:
+  - name: k8s-health-checker
+    newName: registry.example.com/k8s-health-checker
+    newTag: "1.1.1"
+  - name: k8s-health-notifier
+    newName: registry.example.com/k8s-health-notifier
+    newTag: "1.1.1"

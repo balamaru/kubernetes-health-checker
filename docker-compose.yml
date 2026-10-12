@@ -1,0 +1,100 @@
+# Semua konfigurasi penting diambil dari file .env (lihat .env.example).
+
+services:
+  notifier:
+    build: ./notifier
+    image: ${IMAGE_REGISTRY:-local}/k8s-health-notifier:${IMAGE_TAG:-1.1.1}
+    container_name: k8s-health-notifier
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:?DISCORD_WEBHOOK_URL wajib diisi di .env}
+      WEBHOOK_AUTH_TOKEN: ${WEBHOOK_AUTH_TOKEN:?WEBHOOK_AUTH_TOKEN wajib diisi di .env}
+      DISCORD_USERNAME: ${DISCORD_USERNAME:-K8s Health Checker}
+      DISCORD_AVATAR_URL: ${DISCORD_AVATAR_URL:-}
+      DISCORD_MENTION_ON_CRITICAL: ${DISCORD_MENTION_ON_CRITICAL:-}
+      DISCORD_MAX_MESSAGES_PER_REPORT: ${DISCORD_MAX_MESSAGES_PER_REPORT:-5}
+      DRY_RUN: ${NOTIFIER_DRY_RUN:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${NOTIFIER_HOST_PORT:-8080}:8080"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  checker:
+    build: ./checker
+    image: ${IMAGE_REGISTRY:-local}/k8s-health-checker:${IMAGE_TAG:-1.1.1}
+    container_name: k8s-health-checker
+    restart: unless-stopped
+    depends_on:
+      notifier:
+        condition: service_healthy
+    environment:
+      CLUSTER_NAME: ${CLUSTER_NAME:-kubernetes}
+      # --- Koneksi Kubernetes (token read-only) ---
+      K8S_AUTH_MODE: ${K8S_AUTH_MODE:-token}
+      K8S_API_SERVER: ${K8S_API_SERVER:?K8S_API_SERVER wajib diisi di .env}
+      K8S_TOKEN: ${K8S_TOKEN:?K8S_TOKEN wajib diisi di .env}
+      K8S_CA_CERT: ${K8S_CA_CERT:-}
+      K8S_INSECURE_SKIP_TLS_VERIFY: ${K8S_INSECURE_SKIP_TLS_VERIFY:-false}
+      K8S_REQUEST_TIMEOUT: ${K8S_REQUEST_TIMEOUT:-15}
+      # --- Jadwal & cakupan ---
+      CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
+      ENABLED_CHECKS: ${ENABLED_CHECKS:-}
+      NAMESPACES_INCLUDE: ${NAMESPACES_INCLUDE:-}
+      NAMESPACES_EXCLUDE: ${NAMESPACES_EXCLUDE:-}
+      MIN_SEVERITY: ${MIN_SEVERITY:-warning}
+      # --- Ambang batas ---
+      POD_RESTART_THRESHOLD: ${POD_RESTART_THRESHOLD:-5}
+      POD_PENDING_MINUTES: ${POD_PENDING_MINUTES:-5}
+      POD_NOT_READY_MINUTES: ${POD_NOT_READY_MINUTES:-5}
+      EVENT_WINDOW_MINUTES: ${EVENT_WINDOW_MINUTES:-15}
+      EVENT_MIN_COUNT: ${EVENT_MIN_COUNT:-3}
+      JOB_FAILED_LOOKBACK_HOURS: ${JOB_FAILED_LOOKBACK_HOURS:-24}
+      PVC_PENDING_MINUTES: ${PVC_PENDING_MINUTES:-5}
+      LB_PENDING_MINUTES: ${LB_PENDING_MINUTES:-10}
+      # --- Notifikasi (ke service webhook notifier) ---
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-http://notifier:8080/webhook}
+      NOTIFY_WEBHOOK_TOKEN: ${WEBHOOK_AUTH_TOKEN}
+      NOTIFY_RESOLVED: ${NOTIFY_RESOLVED:-true}
+      REMINDER_INTERVAL_MINUTES: ${REMINDER_INTERVAL_MINUTES:-60}
+      MAX_FINDINGS_PER_REPORT: ${MAX_FINDINGS_PER_REPORT:-50}
+      # --- Diagnostik nyata (log/event/spec) ---
+      DIAGNOSTICS_ENABLED: ${DIAGNOSTICS_ENABLED:-true}
+      DIAGNOSTICS_INCLUDE_LOGS: ${DIAGNOSTICS_INCLUDE_LOGS:-true}
+      DIAGNOSTICS_LOG_TAIL_LINES: ${DIAGNOSTICS_LOG_TAIL_LINES:-60}
+      NOTIFY_LOG_LINES: ${NOTIFY_LOG_LINES:-8}
+      # --- Analisis & remediasi LLM (kosongkan LLM_PROVIDER untuk menonaktifkan) ---
+      REMEDIATION_ENABLED: ${REMEDIATION_ENABLED:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_VERSION: ${LLM_API_VERSION:-}
+      LLM_EXTRA_HEADERS: ${LLM_EXTRA_HEADERS:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1500}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-}
+      LLM_MAX_FINDINGS_PER_RUN: ${LLM_MAX_FINDINGS_PER_RUN:-10}
+      LLM_CONCURRENCY: ${LLM_CONCURRENCY:-3}
+      LLM_MIN_SEVERITY: ${LLM_MIN_SEVERITY:-warning}
+      LLM_LANGUAGE: ${LLM_LANGUAGE:-Bahasa Indonesia}
+      LLM_SEND_LOGS: ${LLM_SEND_LOGS:-true}
+      # --- Lain-lain ---
+      STATE_FILE: /data/state.json
+      HEALTH_PORT: "8081"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${CHECKER_HOST_PORT:-8081}:8081"
+    # Agar bisa menjangkau Ollama/LLM lokal di host: LLM_BASE_URL=http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - checker-state:/data
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+volumes:
+  checker-state:

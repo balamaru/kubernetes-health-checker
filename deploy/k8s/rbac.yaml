@@ -1,0 +1,66 @@
+# ServiceAccount + ClusterRole READ-ONLY untuk checker.
+# Hanya verb get/list/watch, tanpa akses ke Secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-health-checker
+  namespace: k8s-health
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-health-checker-readonly
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, services, endpoints, events, namespaces,
+                persistentvolumes, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  # Log container — bahan analisis akar masalah (read-only)
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/version", "/readyz", "/readyz/*", "/livez", "/livez/*", "/healthz"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-health-checker-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-health-checker-readonly
+subjects:
+  - kind: ServiceAccount
+    name: k8s-health-checker
+    namespace: k8s-health
+---
+# Token long-lived untuk menjalankan checker DI LUAR cluster (docker compose).
+# Ambil dengan: ./scripts/get-readonly-token.sh
+# Tidak diperlukan bila checker di-deploy di dalam cluster (mode incluster).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8s-health-checker-token
+  namespace: k8s-health
+  annotations:
+    kubernetes.io/service-account.name: k8s-health-checker
+type: kubernetes.io/service-account-token

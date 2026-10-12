@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-health-checker-config
+  namespace: k8s-health
+data:
+  CLUSTER_NAME: "production"
+  K8S_AUTH_MODE: "incluster"
+  CHECK_INTERVAL_SECONDS: "60"
+  ENABLED_CHECKS: ""
+  NAMESPACES_INCLUDE: ""
+  NAMESPACES_EXCLUDE: ""
+  MIN_SEVERITY: "warning"
+  POD_RESTART_THRESHOLD: "5"
+  POD_PENDING_MINUTES: "5"
+  POD_NOT_READY_MINUTES: "5"
+  EVENT_WINDOW_MINUTES: "15"
+  EVENT_MIN_COUNT: "3"
+  JOB_FAILED_LOOKBACK_HOURS: "24"
+  PVC_PENDING_MINUTES: "5"
+  LB_PENDING_MINUTES: "10"
+  NOTIFY_WEBHOOK_URL: "http://k8s-health-notifier.k8s-health.svc:8080/webhook"
+  NOTIFY_RESOLVED: "true"
+  REMINDER_INTERVAL_MINUTES: "60"
+  DIAGNOSTICS_ENABLED: "true"
+  DIAGNOSTICS_INCLUDE_LOGS: "true"
+  DIAGNOSTICS_LOG_TAIL_LINES: "60"
+  NOTIFY_LOG_LINES: "8"
+  REMEDIATION_ENABLED: "true"
+  # Kosongkan LLM_PROVIDER untuk menonaktifkan analisis LLM. API key taruh di Secret
+  # k8s-health-secrets. Key LLM_* yang juga ada di Secret akan menimpa nilai di sini.
+  LLM_PROVIDER: ""
+  LLM_MODEL: ""
+  LLM_BASE_URL: ""
+  LLM_API_VERSION: ""
+  LLM_MAX_FINDINGS_PER_RUN: "10"
+  LLM_CONCURRENCY: "3"
+  LLM_MIN_SEVERITY: "warning"
+  LLM_LANGUAGE: "Bahasa Indonesia"
+  LLM_SEND_LOGS: "true"
+  STATE_FILE: "/data/state.json"
+  HEALTH_PORT: "8081"
+  LOG_LEVEL: "INFO"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-health-checker
+  namespace: k8s-health
+  labels: {app: k8s-health-checker}
+spec:
+  replicas: 1          # cukup 1 — lebih dari 1 akan mengirim notifikasi ganda
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: k8s-health-checker}
+  template:
+    metadata:
+      labels: {app: k8s-health-checker}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: k8s-health-checker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: checker
+          image: k8s-health-checker:1.1.1
+          imagePullPolicy: IfNotPresent
+          # Urutan penting: key di Secret MENIMPA key yang sama di ConfigMap,
+          # jadi LLM_PROVIDER/LLM_MODEL/dll. boleh ditaruh di ConfigMap atau di Secret.
+          envFrom:
+            - configMapRef: {name: k8s-health-checker-config}
+            - secretRef: {name: k8s-health-secrets, optional: true}
+          env:
+            - name: NOTIFY_WEBHOOK_TOKEN
+              valueFrom: {secretKeyRef: {name: k8s-health-secrets, key: WEBHOOK_AUTH_TOKEN}}
+          ports:
+            - {name: http, containerPort: 8081}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: state, mountPath: /data}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-health-checker
+  namespace: k8s-health
+spec:
+  selector: {app: k8s-health-checker}
+  ports:
+    - {name: http, port: 8081, targetPort: http}
