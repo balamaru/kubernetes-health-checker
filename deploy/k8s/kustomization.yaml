@@ -12,7 +12,7 @@ resources:
 images:
   - name: k8s-health-checker
     newName: registry.example.com/k8s-health-checker
-    newTag: "1.1.1"
+    newTag: "1.2.0"
   - name: k8s-health-notifier
     newName: registry.example.com/k8s-health-notifier
-    newTag: "1.1.1"
+    newTag: "1.2.0"

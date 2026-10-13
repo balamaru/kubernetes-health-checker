@@ -92,6 +92,26 @@ def insights(f: Finding, ctx: dict) -> list[str]:
         elif lines:
             out.append("Baris log terakhir sebelum berhenti: \"" + lines[-1][:250] + "\"")
 
+    if f.check == "pod.log_errors":
+        x = f.extra
+        state = "Ready" if x.get("ready") else "Running (belum semua Ready)"
+        out.append(f"Container '{x.get('container')}' berstatus {state} di {x.get('pods_affected')}/{x.get('pods_scanned')} pod, "
+                   f"namun mencatat {x.get('error_count')} baris error dalam {x.get('window_minutes')} menit terakhir — "
+                   "status pod & probe tidak mencerminkan kondisi aplikasi.")
+        sigs = x.get("signatures") or []
+        if sigs:
+            out.append(f"Error terbanyak ({sigs[0]['count']}×): \"{sigs[0]['signature'][:200]}\"")
+        if c:
+            missing = [n for n in ("readinessProbe", "livenessProbe") if not c.get(n)]
+            if missing:
+                out.append(f"Container '{c.get('name')}' tidak memiliki {' & '.join(missing)} — Kubernetes tidak punya cara "
+                           "mengetahui aplikasi bermasalah.")
+            elif c.get("readinessProbe"):
+                out.append(f"Readiness probe tetap lolos ({c['readinessProbe']}); pertimbangkan endpoint health yang "
+                           "ikut memeriksa dependensi kritis.")
+        if x.get("fatal"):
+            out.append("Ditemukan baris FATAL/panic/Traceback — kemungkinan sebagian fungsi aplikasi berhenti meski proses tetap hidup.")
+
     if f.check == "pod.not_ready" and c and c.get("readinessProbe"):
         out.append(f"Readiness probe container '{c['name']}': {c['readinessProbe']}.")
 
@@ -180,7 +200,13 @@ class Analyzer:
             contexts[f.id] = ctx
             f.extra["insights"] = insights(f, ctx)
             excerpt = log_excerpt(ctx, self.cfg.notify_log_lines) if self.cfg.notify_log_lines > 0 else []
-            if excerpt:
+            if f.check == "pod.log_errors":
+                # Pertahankan baris ERROR hasil pemindaian (lebih relevan daripada tail log).
+                if self.cfg.notify_log_lines > 0:
+                    f.extra["log_excerpt"] = (f.extra.get("log_excerpt") or [])[-self.cfg.notify_log_lines:]
+                else:
+                    f.extra.pop("log_excerpt", None)
+            elif excerpt:
                 f.extra["log_excerpt"] = excerpt
 
         if not self.llm:
@@ -200,6 +226,13 @@ class Analyzer:
         ctx_for_llm = ctx
         if not self.cfg.llm_send_logs:
             ctx_for_llm = {k: v for k, v in ctx.items() if k not in ("logs", "worst_pod_logs")}
+            if "log_error_scan" in ctx_for_llm:
+                ctx_for_llm["log_error_scan"] = {k: v for k, v in ctx["log_error_scan"].items()
+                                                 if k not in ("sample_error_lines", "top_error_signatures")}
+        evidence, facts = f.evidence, f.extra.get("insights") or []
+        if f.check == "pod.log_errors" and not self.cfg.llm_send_logs:
+            evidence = evidence[:3]  # sisanya berisi potongan isi log
+            facts = [x for x in facts if not x.startswith("Error terbanyak")]
         payload = {
             "cluster": self.cfg.cluster_name,
             "finding": {
@@ -208,9 +241,9 @@ class Analyzer:
                 "category": f.category,
                 "check": f.check,
                 "resource": f.resource.ref(),
-                "detector_evidence": [redact(e) for e in f.evidence if e],
+                "detector_evidence": [redact(e) for e in evidence if e],
                 "generic_explanation": f.explanation,
-                "derived_facts": f.extra.get("insights") or [],
+                "derived_facts": facts,
             },
             "other_active_findings_in_cluster": [o for o in others if f.title not in o],
         }

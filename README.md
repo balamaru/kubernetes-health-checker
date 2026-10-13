@@ -1,12 +1,14 @@
 # K8s Health Checker → Discord
 
-**Versi 1.1.1**
+**Versi 1.2.0**
 
 Service untuk melakukan health check pada cluster Kubernetes (token **read-only**) dan mengirim laporan ke Discord berisi:
 
 1. **Ada masalah apa**: judul temuan (cluster down, node NotReady, pod CrashLoopBackOff, DNS/CNI bermasalah, dsb.)
 2. **Kenapa error**: dianalisis dari **data nyata cluster**, yaitu spec container (limit/request, probe, referensi Secret/ConfigMap), event objek, **log container sebelum crash**, kondisi & kapasitas node, status owner (Deployment/Job), endpoint Service, dan StorageClass.
 3. **Remediasi**: langkah perbaikan spesifik untuk objek tersebut beserta perintah `kubectl`, dihasilkan oleh **LLM yang digunakan** (lihat [Kompatibilitas LLM](#kompatibilitas-llm)).
+
+4. **Pod "Running" yang sebenarnya error**: pod yang terlihat sehat di `kubectl get pods` (Running, bahkan Ready, restart 0) tetapi log aplikasinya terus mencatat ERROR ikut dilaporkan (lihat [Pemindaian log](#pemindaian-log-pod-runningready)).
 
 Tanpa LLM notifikasi tetap memuat **temuan dari data cluster** (mis. "memory limit 256Mi terlampaui", baris error dari log, targetPort tidak cocok, StorageClass tidak ada) dan potongan log, bukan sekadar template.
 
@@ -15,6 +17,7 @@ Tanpa LLM notifikasi tetap memuat **temuan dari data cluster** (mis. "memory lim
 - [Arsitektur](#arsitektur)
 - [Kompatibilitas](#kompatibilitas)
 - [Apa saja yang diperiksa](#apa-saja-yang-diperiksa)
+- [Pemindaian log pod Running/Ready](#pemindaian-log-pod-runningready)
 - [Analisis & remediasi](#analisis--remediasi)
 - [Menjalankan dengan Docker Compose](#menjalankan-dengan-docker-compose-checker-di-luar-cluster)
 - [Deploy di dalam cluster](#deploy-di-dalam-cluster)
@@ -124,10 +127,44 @@ Kebutuhan model: mampu mengikuti instruksi untuk membalas **satu objek JSON** da
 | Cluster / control plane | API server tidak terjangkau / token 401 / TLS error, `/readyz` gagal (mis. etcd), semua/mayoritas node NotReady, static pod control plane tidak Ready |
 | Node | NotReady / Unknown, MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable, cordon (info) |
 | Pod | CrashLoopBackOff (dengan analisis exit code & OOMKilled), ImagePullBackOff/ErrImagePull, CreateContainerConfigError, tertahan ContainerCreating, Pending/Unschedulable (dengan analisis pesan scheduler), Running tapi tidak Ready, Evicted (diagregasi per namespace), Failed, tertahan Terminating |
+| Log aplikasi | Pod **Running/Ready** yang log-nya berisi ERROR/FATAL/panic/exception melewati ambang dalam jendela waktu (digabung per workload + container) |
 | Workload | Deployment tidak available / rollout macet, StatefulSet & DaemonSet tidak lengkap, Job gagal, HPA tidak dapat scaling |
 | Jaringan in-cluster | CoreDNS/kube-dns down, DaemonSet CNI/kube-proxy tidak sehat, Service tanpa endpoint siap, LoadBalancer tanpa IP, event `FailedCreatePodSandBox`/`NetworkNotReady` |
 | Storage | PVC Pending/Lost, PV Failed |
 | Event | Warning event penting (FailedMount, Unhealthy, FailedCreate, SystemOOM, ProvisioningFailed, …) dalam jendela waktu |
+
+## Pemindaian log pod Running/Ready
+
+Kubernetes hanya memantau **proses** container dan **probe**. Aplikasi yang terus gagal (koneksi DB/cache ditolak, timeout ke service lain, exception per request, kredensial kedaluwarsa) tetap berstatus `Running`/`Ready` selama prosesnya hidup dan probe-nya lolos, sehingga DevOps/SRE mengira aman. Check `logs` menutup celah ini:
+
+1. Setiap siklus, checker membaca log **terbaru** (`sinceSeconds` = `LOG_SCAN_WINDOW_MINUTES`) dari setiap container yang `Running` (read-only, izin `pods/log` yang sudah ada).
+2. Baris dihitung sebagai error berdasarkan **level log**, bukan sekadar kata "error": `ERROR`/`FATAL`/`CRITICAL`/`SEVERE`, `level=error` (logfmt), `"level":"error"` (JSON), klog `E1013 …`, `panic:`, `Traceback`, `…Exception:`, `[error]` nginx, `PHP Fatal error`. Baris seperti `errors=0`, `GET /api/errors 200`, atau `level=info msg="no error"` **tidak** dihitung.
+3. Error serupa dikelompokkan jadi *signature* (angka, IP, UUID, timestamp dihapus) sehingga notifikasi menampilkan mis. `13× ERROR PaymentGateway: request to https://psp.example/charge timed out after <n>ms`.
+4. Hasil digabung **per workload + container** (mis. `Deployment/shop/pay [app]`), bukan per pod, sehingga 10 replika yang error sama menghasilkan satu notifikasi dan pod yang berganti nama saat rollout tidak memicu notifikasi baru.
+5. Total error ≥ `LOG_SCAN_MIN_ERRORS` → **warning**, ≥ `LOG_SCAN_CRITICAL_ERRORS` → **critical**. Saat error berhenti (di bawah ambang dalam jendela waktu), dikirim **RESOLVED**.
+
+Pod yang sudah punya temuan lain (CrashLoopBackOff, not Ready, dll.) tidak dipindai ulang karena log-nya sudah ikut di temuan tersebut. Contoh notifikasi:
+
+```
+🟠 [BARU] Pod Running & Ready tetapi log berisi error: shop/pay [app]
+Temuan dari data cluster:
+• Container 'app' berstatus Ready di 2/2 pod, namun mencatat 17 baris error dalam 10 menit terakhir — status pod & probe tidak mencerminkan kondisi aplikasi.
+• Error terbanyak (13×): "ERROR PaymentGateway: request to https://psp.example/charge timed out after <n>ms (order=<n>)"
+• Container 'app' tidak memiliki livenessProbe — Kubernetes tidak punya cara mengetahui aplikasi bermasalah.
+Detail deteksi:   17 baris error … 2/2 pod terdampak · status: Running & Ready, total restart=0 · pod: pay-6f7b-k2 (16), pay-6f7b-k3 (1)
+Baris error di log (pay-6f7b-k2):  …contoh baris ERROR (rahasia disamarkan)…
+```
+
+Pengaturan per pod lewat anotasi (di `spec.template.metadata.annotations`):
+
+| Anotasi | Contoh | Fungsi |
+|---|---|---|
+| `health-checker.io/log-scan` | `"false"` | Jangan pindai log pod ini |
+| `health-checker.io/log-error-pattern` | `"(?i)\\bpayment failed\\b"` | Regex error khusus aplikasi ini (menggantikan pola default) |
+| `health-checker.io/log-ignore-pattern` | `"healthcheck\|deprecated"` | Regex baris error yang diabaikan |
+| `health-checker.io/log-min-errors` | `"20"` | Ambang warning khusus aplikasi yang memang "berisik" |
+
+Beban ke API server: satu request `pods/log` per container per pemindaian, dibatasi `LOG_SCAN_MAX_CONTAINERS` (bergiliran per workload bila lebih) dan `LOG_SCAN_CONCURRENCY`. Untuk cluster besar, set `LOG_SCAN_INTERVAL_SECONDS` (mis. `300`) — di antara pemindaian, hasil terakhir dipertahankan sehingga tidak dianggap resolved. Pemindaian bisa dimatikan dengan mengisi `ENABLED_CHECKS` tanpa `logs`. **Upgrade dari 1.1.x:** bila `ENABLED_CHECKS` Anda diisi eksplisit, tambahkan `logs` agar fitur ini aktif (bila kosong, otomatis aktif).
 
 ## Analisis & remediasi
 
@@ -142,6 +179,7 @@ Data diagnostik yang dikumpulkan per jenis temuan:
 
 | Jenis temuan | Data nyata yang diambil |
 |---|---|
+| Log error pada pod Running/Ready | Ringkasan pemindaian (jumlah, signature, contoh baris), spec container & probe, event pod, log saat ini, Deployment pemilik |
 | Pod (crash, OOM, image, config, pending, not ready) | Spec container, status & terminasi terakhir, event pod, log *previous* & saat ini, node (kapasitas & request terpakai), Deployment pemilik |
 | Node | Kondisi, taint, allocatable vs request terpakai, versi kubelet/runtime, event node, pod non-Running di node |
 | Deployment / StatefulSet / DaemonSet / DNS | Spec & kondisi, pod terkait, event + log pod terburuk |
@@ -194,10 +232,10 @@ curl -X POST -H "Authorization: Bearer <WEBHOOK_AUTH_TOKEN>" http://localhost:80
 ## Deploy di dalam cluster
 
 ```bash
-docker build -t registry.example.com/k8s-health-checker:1.1.1 ./checker
-docker build -t registry.example.com/k8s-health-notifier:1.1.1 ./notifier
-docker push registry.example.com/k8s-health-checker:1.1.1
-docker push registry.example.com/k8s-health-notifier:1.1.1
+docker build -t registry.example.com/k8s-health-checker:1.2.0 ./checker
+docker build -t registry.example.com/k8s-health-notifier:1.2.0 ./notifier
+docker push registry.example.com/k8s-health-checker:1.2.0
+docker push registry.example.com/k8s-health-notifier:1.2.0
 
 kubectl apply -f deploy/k8s/namespace.yaml
 kubectl -n k8s-health create secret generic k8s-health-secrets \
@@ -253,7 +291,7 @@ Daftar lengkap ada di [`.env.example`](.env.example).
 | `K8S_REQUEST_TIMEOUT` | `15` | Detik |
 | `CHECK_INTERVAL_SECONDS` | `60` | Interval pemeriksaan (min 10) |
 | `RUN_ONCE` | `false` | Jalankan sekali lalu keluar (cocok untuk CronJob/CI) |
-| `ENABLED_CHECKS` | semua | `cluster,nodes,pods,workloads,network,storage,events` |
+| `ENABLED_CHECKS` | semua | `cluster,nodes,pods,logs,workloads,network,storage,events` |
 | `NAMESPACES_INCLUDE` / `NAMESPACES_EXCLUDE` | – | Daftar namespace dipisah koma |
 | `MIN_SEVERITY` | `warning` | `info` / `warning` / `critical` |
 | `POD_RESTART_THRESHOLD` | `5` | Restart dalam jendela event dianggap crash berulang |
@@ -263,6 +301,14 @@ Daftar lengkap ada di [`.env.example`](.env.example).
 | `EVENT_MIN_COUNT` | `3` | Minimal kejadian probe gagal (`Unhealthy`) |
 | `JOB_FAILED_LOOKBACK_HOURS` | `24` | Job gagal yang masih dilaporkan |
 | `PVC_PENDING_MINUTES` / `LB_PENDING_MINUTES` | `5` / `10` | Batas PVC Pending / LoadBalancer tanpa IP |
+| `LOG_SCAN_WINDOW_MINUTES` | `10` | Jendela log yang dibaca untuk check `logs` |
+| `LOG_SCAN_INTERVAL_SECONDS` | `0` | Jarak antar pemindaian log (0 = setiap siklus) |
+| `LOG_SCAN_MIN_ERRORS` / `LOG_SCAN_CRITICAL_ERRORS` | `5` / `50` | Ambang warning / critical (total baris error per workload+container) |
+| `LOG_SCAN_TAIL_LINES` / `LOG_SCAN_LIMIT_BYTES` | `1000` / `512000` | Batas log yang dibaca per container |
+| `LOG_SCAN_MAX_CONTAINERS` / `LOG_SCAN_CONCURRENCY` | `300` / `5` | Batas container per siklus (bergiliran) / request paralel |
+| `LOG_SCAN_SAMPLE_LINES` | `8` | Contoh baris error yang disimpan (ditampilkan maks. `NOTIFY_LOG_LINES`) |
+| `LOG_SCAN_NAMESPACES_INCLUDE` / `_EXCLUDE` | – | Namespace khusus pemindaian log |
+| `LOG_SCAN_ERROR_PATTERN` / `LOG_SCAN_IGNORE_PATTERN` | default level-log / – | Regex Python untuk baris error / baris yang diabaikan |
 | `NOTIFY_WEBHOOK_URL` | – | URL notifier, mis. `http://notifier:8080/webhook` (kosong = hanya log) |
 | `NOTIFY_WEBHOOK_TOKEN` | – | Harus sama dengan `WEBHOOK_AUTH_TOKEN` notifier |
 | `NOTIFY_RESOLVED` | `true` | Kirim notifikasi saat masalah selesai |
@@ -395,11 +441,11 @@ Tersedia fake Kubernetes API (±20 skenario error, termasuk log container), fake
 python -m unittest discover -s tests -v
 ```
 
-Cakupan test (25 test): deteksi semua kategori, dedup/pengingat/resolved, API down & token salah, TLS, persistensi state, autentikasi notifier, batas embed Discord, keenam provider LLM, cache analisis, fallback saat LLM gagal, penyamaran rahasia, dan validasi konfigurasi.
+Cakupan test (37 test): deteksi semua kategori, dedup/pengingat/resolved, API down & token salah, TLS, persistensi state, pemindaian log pod Running/Ready (pola, ambang, anotasi, rotasi, interval), autentikasi notifier, batas embed Discord, keenam provider LLM, cache analisis, fallback saat LLM gagal, penyamaran rahasia, dan validasi konfigurasi.
 
 ## Izin RBAC
 
-ClusterRole di `deploy/k8s/rbac.yaml` hanya memakai verb `get/list/watch`, ditambah `get pods/log` (untuk analisis log) dan `storageclasses`. Secret **tidak** termasuk.
+ClusterRole di `deploy/k8s/rbac.yaml` hanya memakai verb `get/list/watch`, ditambah `get pods/log` (untuk analisis log & pemindaian log pod Running) dan `storageclasses`. Secret **tidak** termasuk.
 
 ## Struktur proyek
 
@@ -412,6 +458,7 @@ kubernetes-check/
 │       ├── config.py           # semua env
 │       ├── k8s.py              # klien REST Kubernetes (read-only)
 │       ├── checks.py           # pemeriksaan kesehatan
+│       ├── logscan.py          # deteksi error di log pod Running/Ready
 │       ├── knowledge.py        # penjelasan berbasis aturan
 │       ├── diagnostics.py      # pengumpul data nyata (spec, event, log, node)
 │       ├── remediation.py      # insight + analisis LLM

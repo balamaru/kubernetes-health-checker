@@ -3,7 +3,7 @@
 services:
   notifier:
     build: ./notifier
-    image: ${IMAGE_REGISTRY:-local}/k8s-health-notifier:${IMAGE_TAG:-1.1.1}
+    image: ${IMAGE_REGISTRY:-local}/k8s-health-notifier:${IMAGE_TAG:-1.2.0}
     container_name: k8s-health-notifier
     restart: unless-stopped
     environment:
@@ -24,7 +24,7 @@ services:
 
   checker:
     build: ./checker
-    image: ${IMAGE_REGISTRY:-local}/k8s-health-checker:${IMAGE_TAG:-1.1.1}
+    image: ${IMAGE_REGISTRY:-local}/k8s-health-checker:${IMAGE_TAG:-1.2.0}
     container_name: k8s-health-checker
     restart: unless-stopped
     depends_on:
@@ -54,6 +54,20 @@ services:
       JOB_FAILED_LOOKBACK_HOURS: ${JOB_FAILED_LOOKBACK_HOURS:-24}
       PVC_PENDING_MINUTES: ${PVC_PENDING_MINUTES:-5}
       LB_PENDING_MINUTES: ${LB_PENDING_MINUTES:-10}
+      # --- Pemindaian log pod Running/Ready (error aplikasi tersembunyi) ---
+      LOG_SCAN_WINDOW_MINUTES: ${LOG_SCAN_WINDOW_MINUTES:-10}
+      LOG_SCAN_INTERVAL_SECONDS: ${LOG_SCAN_INTERVAL_SECONDS:-0}
+      LOG_SCAN_MIN_ERRORS: ${LOG_SCAN_MIN_ERRORS:-5}
+      LOG_SCAN_CRITICAL_ERRORS: ${LOG_SCAN_CRITICAL_ERRORS:-50}
+      LOG_SCAN_TAIL_LINES: ${LOG_SCAN_TAIL_LINES:-1000}
+      LOG_SCAN_LIMIT_BYTES: ${LOG_SCAN_LIMIT_BYTES:-512000}
+      LOG_SCAN_MAX_CONTAINERS: ${LOG_SCAN_MAX_CONTAINERS:-300}
+      LOG_SCAN_CONCURRENCY: ${LOG_SCAN_CONCURRENCY:-5}
+      LOG_SCAN_SAMPLE_LINES: ${LOG_SCAN_SAMPLE_LINES:-8}
+      LOG_SCAN_NAMESPACES_INCLUDE: ${LOG_SCAN_NAMESPACES_INCLUDE:-}
+      LOG_SCAN_NAMESPACES_EXCLUDE: ${LOG_SCAN_NAMESPACES_EXCLUDE:-}
+      LOG_SCAN_ERROR_PATTERN: ${LOG_SCAN_ERROR_PATTERN:-}
+      LOG_SCAN_IGNORE_PATTERN: ${LOG_SCAN_IGNORE_PATTERN:-}
       # --- Notifikasi (ke service webhook notifier) ---
       NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-http://notifier:8080/webhook}
       NOTIFY_WEBHOOK_TOKEN: ${WEBHOOK_AUTH_TOKEN}

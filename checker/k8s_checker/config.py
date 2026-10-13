@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
-ALL_CHECKS = ("cluster", "nodes", "pods", "workloads", "network", "storage", "events")
+ALL_CHECKS = ("cluster", "nodes", "pods", "logs", "workloads", "network", "storage", "events")
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
 
@@ -92,6 +93,21 @@ class Config:
     pvc_pending_minutes: int = 5
     lb_pending_minutes: int = 10
 
+    # Pemindaian log pod yang Running/Ready (error aplikasi yang tidak terlihat dari status pod)
+    log_scan_window_minutes: int = 10
+    log_scan_interval_seconds: int = 0       # 0 = setiap siklus
+    log_scan_min_errors: int = 5             # >= ini -> warning
+    log_scan_critical_errors: int = 50       # >= ini -> critical
+    log_scan_tail_lines: int = 1000
+    log_scan_limit_bytes: int = 512000
+    log_scan_max_containers: int = 300       # per siklus (bergiliran bila lebih)
+    log_scan_concurrency: int = 5
+    log_scan_error_pattern: str = ""         # regex; kosong = pola default (level log)
+    log_scan_ignore_pattern: str = ""        # regex baris yang diabaikan
+    log_scan_namespaces_include: list[str] = field(default_factory=list)
+    log_scan_namespaces_exclude: list[str] = field(default_factory=list)
+    log_scan_sample_lines: int = 8
+
     # Notifikasi
     notify_webhook_url: str = ""
     notify_webhook_token: str = ""
@@ -154,6 +170,19 @@ class Config:
             job_failed_lookback_hours=_int("JOB_FAILED_LOOKBACK_HOURS", 24),
             pvc_pending_minutes=_int("PVC_PENDING_MINUTES", 5),
             lb_pending_minutes=_int("LB_PENDING_MINUTES", 10),
+            log_scan_window_minutes=_int("LOG_SCAN_WINDOW_MINUTES", 10),
+            log_scan_interval_seconds=_int("LOG_SCAN_INTERVAL_SECONDS", 0),
+            log_scan_min_errors=_int("LOG_SCAN_MIN_ERRORS", 5),
+            log_scan_critical_errors=_int("LOG_SCAN_CRITICAL_ERRORS", 50),
+            log_scan_tail_lines=_int("LOG_SCAN_TAIL_LINES", 1000),
+            log_scan_limit_bytes=_int("LOG_SCAN_LIMIT_BYTES", 512000),
+            log_scan_max_containers=_int("LOG_SCAN_MAX_CONTAINERS", 300),
+            log_scan_concurrency=_int("LOG_SCAN_CONCURRENCY", 5),
+            log_scan_error_pattern=os.environ.get("LOG_SCAN_ERROR_PATTERN", "").strip(),
+            log_scan_ignore_pattern=os.environ.get("LOG_SCAN_IGNORE_PATTERN", "").strip(),
+            log_scan_namespaces_include=_list("LOG_SCAN_NAMESPACES_INCLUDE"),
+            log_scan_namespaces_exclude=_list("LOG_SCAN_NAMESPACES_EXCLUDE"),
+            log_scan_sample_lines=_int("LOG_SCAN_SAMPLE_LINES", 8),
             notify_webhook_url=_str("NOTIFY_WEBHOOK_URL"),
             notify_webhook_token=_str("NOTIFY_WEBHOOK_TOKEN"),
             notify_timeout=_int("NOTIFY_TIMEOUT", 30),
@@ -196,6 +225,19 @@ class Config:
             raise ValueError("K8S_AUTH_MODE harus auto | token | incluster")
         if self.check_interval_seconds < 10:
             raise ValueError("CHECK_INTERVAL_SECONDS minimal 10")
+        if self.log_scan_min_errors < 1:
+            raise ValueError("LOG_SCAN_MIN_ERRORS minimal 1")
+        if self.log_scan_critical_errors < self.log_scan_min_errors:
+            raise ValueError("LOG_SCAN_CRITICAL_ERRORS harus >= LOG_SCAN_MIN_ERRORS")
+        if self.log_scan_window_minutes < 1:
+            raise ValueError("LOG_SCAN_WINDOW_MINUTES minimal 1")
+        for name, pat in (("LOG_SCAN_ERROR_PATTERN", self.log_scan_error_pattern),
+                          ("LOG_SCAN_IGNORE_PATTERN", self.log_scan_ignore_pattern)):
+            if pat:
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    raise ValueError(f"{name} bukan regex valid: {exc}") from exc
         if self.llm_min_severity not in SEVERITY_ORDER:
             raise ValueError(f"LLM_MIN_SEVERITY harus salah satu dari {list(SEVERITY_ORDER)}")
         if self.llm_enabled:
@@ -231,6 +273,13 @@ class Config:
             return False
         return namespace not in self.namespaces_exclude
 
+    def log_scan_namespace_allowed(self, namespace: str | None) -> bool:
+        if not self.namespace_allowed(namespace):
+            return False
+        if self.log_scan_namespaces_include and namespace not in self.log_scan_namespaces_include:
+            return False
+        return namespace not in self.log_scan_namespaces_exclude
+
     def check_enabled(self, name: str) -> bool:
         return name in self.enabled_checks
 
@@ -249,6 +298,14 @@ class Config:
             "min_severity": self.min_severity,
             "notify_webhook_url": "set" if self.notify_webhook_url else "unset",
             "diagnostics_enabled": self.diagnostics_enabled,
+            "log_scan": {
+                "enabled": self.check_enabled("logs"),
+                "window_minutes": self.log_scan_window_minutes,
+                "min_errors": self.log_scan_min_errors,
+                "critical_errors": self.log_scan_critical_errors,
+                "custom_pattern": bool(self.log_scan_error_pattern),
+                "namespaces_exclude": self.log_scan_namespaces_exclude,
+            },
             "llm": {
                 "enabled": self.llm_enabled,
                 "status": self.llm_status,

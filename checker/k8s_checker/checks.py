@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Callable
 
 from . import knowledge as kb
+from . import logscan
 from .config import ALL_CHECKS, Config
 from .k8s import K8sClient, K8sError
 from .models import Finding, Resource, parse_time, utcnow
@@ -58,6 +62,12 @@ class HealthChecker:
         self.k = client
         self.cfg = cfg
         self._cache: dict[str, list[dict]] = {}
+        # state pemindaian log (bertahan antar siklus)
+        self._log_offset = 0
+        self._log_last_scan = 0.0
+        self._log_last_findings: list[dict] = []
+        self._log_error_re = logscan.compile_pattern(cfg.log_scan_error_pattern, logscan.DEFAULT_ERROR_PATTERN)
+        self._log_ignore_re = logscan.compile_pattern(cfg.log_scan_ignore_pattern)
 
     # helpers
     @property
@@ -111,6 +121,7 @@ class HealthChecker:
             ("cluster", self.check_cluster),
             ("nodes", self.check_nodes),
             ("pods", self.check_pods),
+            ("logs", self.check_logs),
             ("workloads", self.check_workloads),
             ("network", self.check_network),
             ("storage", self.check_storage),
@@ -479,6 +490,181 @@ class HealthChecker:
                 reason="evicted",
                 extra={"count": len(items)},
             ))
+
+    # logs — pod Running/Ready yang log-nya berisi error
+    ANN_SKIP = "health-checker.io/log-scan"
+    ANN_PATTERN = "health-checker.io/log-error-pattern"
+    ANN_IGNORE = "health-checker.io/log-ignore-pattern"
+    ANN_MIN = "health-checker.io/log-min-errors"
+
+    def check_logs(self, r: RunResult) -> None:
+        cfg = self.cfg
+        now = time.time()
+        if cfg.log_scan_interval_seconds > 0 and self._log_last_scan and now - self._log_last_scan < cfg.log_scan_interval_seconds:
+            # Belum waktunya memindai ulang: pertahankan hasil terakhir agar tidak dianggap resolved.
+            for d in self._log_last_findings:
+                r.add(Finding.from_dict(d))
+            return
+
+        # Pod yang sudah punya temuan lain (crashloop, not_ready, dll.) tidak dipindai lagi — log-nya
+        # sudah ikut dikirim lewat temuan tersebut.
+        flagged = {f.resource.ref() for f in r.findings if f.resource.kind == "Pod"}
+
+        targets: list[tuple[dict, dict]] = []  # (pod, containerStatus)
+        for p in self.pods():
+            m = _meta(p)
+            ns = m.get("namespace")
+            if (p.get("status") or {}).get("phase") != "Running" or m.get("deletionTimestamp"):
+                continue
+            if not cfg.log_scan_namespace_allowed(ns):
+                continue
+            ann = m.get("annotations") or {}
+            if str(ann.get(self.ANN_SKIP, "")).lower() in ("false", "off", "disabled", "0", "no"):
+                continue
+            if f"Pod/{ns}/{m.get('name')}" in flagged:
+                continue
+            for cs in (p.get("status") or {}).get("containerStatuses") or []:
+                if (cs.get("state") or {}).get("running"):
+                    targets.append((p, cs))
+
+        r.stats["log_scan_candidates"] = len(targets)
+        if not targets:
+            self._log_last_scan, self._log_last_findings = now, []
+            return
+        # Kelompokkan per workload+container; rotasi dilakukan per kelompok agar replika satu workload
+        # selalu dipindai bersama (jumlah error dihitung total per workload).
+        by_group: dict[tuple, list] = defaultdict(list)
+        for p, cs in targets:
+            wkind, wname = logscan.workload_of(p)
+            by_group[(_meta(p).get("namespace"), wkind, wname, cs.get("name"))].append((p, cs))
+        keys = sorted(by_group)
+        limit = max(1, cfg.log_scan_max_containers)
+        if len(targets) > limit:
+            start = self._log_offset % len(keys)
+            order = keys[start:] + keys[:start]
+            chosen, count = [], 0
+            for k in order:
+                if chosen and count + len(by_group[k]) > limit:
+                    break
+                chosen.append(k)
+                count += len(by_group[k])
+            self._log_offset = (start + len(chosen)) % len(keys)
+            partial = True
+        else:
+            chosen, partial = keys, False
+        batch = [item for k in chosen for item in by_group[k]]
+
+        window_s = cfg.log_scan_window_minutes * 60
+
+        def fetch(item):
+            p, cs = item
+            m = _meta(p)
+            started = parse_time(((cs.get("state") or {}).get("running") or {}).get("startedAt"))
+            since = window_s
+            if started:
+                since = max(1, min(window_s, int((utcnow() - started).total_seconds()) + 5))
+            params = {"container": cs.get("name"), "sinceSeconds": since, "tailLines": cfg.log_scan_tail_lines,
+                      "limitBytes": cfg.log_scan_limit_bytes, "timestamps": "false"}
+            try:
+                _, body = self.k.request_raw(f"/api/v1/namespaces/{m.get('namespace')}/pods/{m.get('name')}/log", params)
+            except K8sError as exc:
+                return item, None, exc
+            return item, body, None
+
+        results = []
+        forbidden = 0
+        with ThreadPoolExecutor(max_workers=max(1, cfg.log_scan_concurrency)) as pool:
+            for item, body, err in pool.map(fetch, batch):
+                if err is not None:
+                    if err.kind == "unreachable":
+                        raise err
+                    if err.kind in ("forbidden", "unauthorized"):
+                        forbidden += 1
+                    log.debug("Log %s tidak dapat dibaca: %s", _meta(item[0]).get("name"), err)
+                    continue
+                results.append((item, body))
+        if forbidden and not results:
+            raise K8sError("Tidak punya izin membaca log pod (RBAC pods/log get).", 403, "forbidden")
+        r.stats["log_scanned_containers"] = len(results)
+
+        groups: dict[tuple, list] = defaultdict(list)
+        for (p, cs), body in results:
+            m = _meta(p)
+            ann = m.get("annotations") or {}
+            err_re, ign_re = self._log_error_re, self._log_ignore_re
+            try:
+                if ann.get(self.ANN_PATTERN):
+                    err_re = re.compile(ann[self.ANN_PATTERN], re.M)
+                if ann.get(self.ANN_IGNORE):
+                    ign_re = re.compile(ann[self.ANN_IGNORE], re.M)
+            except re.error as exc:
+                log.warning("Anotasi regex tidak valid pada pod %s/%s: %s", m.get("namespace"), m.get("name"), exc)
+            res = logscan.scan_lines(body.splitlines(), err_re, ign_re, sample_lines=cfg.log_scan_sample_lines)
+            wkind, wname = logscan.workload_of(p)
+            try:
+                min_err = int(ann.get(self.ANN_MIN) or cfg.log_scan_min_errors)
+            except ValueError:
+                min_err = cfg.log_scan_min_errors
+            groups[(m.get("namespace"), wkind, wname, cs.get("name"))].append((p, cs, res, min_err))
+
+        found: list[Finding] = []
+        for (ns, wkind, wname, cname), items in groups.items():
+            total = sum(x[2].error_count for x in items)
+            min_err = min(x[3] for x in items)
+            if total < min_err:
+                continue
+            fatal = any(x[2].fatal for x in items)
+            hit = sorted([x for x in items if x[2].error_count], key=lambda x: -x[2].error_count)
+            worst_p, worst_cs, worst_res, _ = hit[0]
+            all_ready = all(x[1].get("ready") for x in items)
+            restarts = sum(x[1].get("restartCount", 0) for x in items)
+            sev = "critical" if total >= cfg.log_scan_critical_errors else "warning"
+
+            sig_counter: dict[str, int] = defaultdict(int)
+            for x in hit:
+                for sig, n in x[2].signatures:
+                    sig_counter[sig] += n
+            top = sorted(sig_counter.items(), key=lambda kv: -kv[1])[:3]
+
+            label = "Running & Ready" if all_ready else "Running"
+            evidence = [
+                f"{total} baris error dalam {cfg.log_scan_window_minutes} menit terakhir — container '{cname}', "
+                f"{len(hit)}/{len(items)} pod terdampak",
+                f"status: {label}, total restart={restarts} → kubectl get pods terlihat normal",
+                "pod: " + ", ".join(f"{_meta(x[0]).get('name')} ({x[2].error_count})" for x in hit[:5])
+                + (f", +{len(hit) - 5} lainnya" if len(hit) > 5 else ""),
+            ] + [f"{n}× {sig}" for sig, n in top]
+            found.append(Finding(
+                check="pod.log_errors",
+                category="pod",
+                severity=sev,
+                title=f"Pod {label} tetapi log berisi error: {ns}/{wname} [{cname}]",
+                explanation=kb.LOG_ERRORS_EXPLANATION,
+                resource=Resource(kind=wkind, name=wname, namespace=ns),
+                evidence=evidence,
+                reason=f"logerr:{cname}",
+                extra={
+                    "container": cname, "pod": _meta(worst_p).get("name"), "error_count": total,
+                    "pods_affected": len(hit), "pods_scanned": len(items), "ready": all_ready,
+                    "fatal": fatal, "window_minutes": cfg.log_scan_window_minutes,
+                    "signatures": [{"signature": s_, "count": n} for s_, n in top],
+                    "log_excerpt": worst_res.samples, "log_label": f"Baris error di log ({_meta(worst_p).get('name')})",
+                    "node": (worst_p.get("spec") or {}).get("nodeName"),
+                },
+            ))
+
+        if partial:
+            # Container yang tidak dipindai pada siklus ini: pertahankan temuan lamanya.
+            scanned = set(chosen)
+            for d in self._log_last_findings:
+                old = Finding.from_dict(d)
+                key = (old.resource.namespace, old.resource.kind, old.resource.name, old.extra.get("container"))
+                if key not in scanned:
+                    found.append(old)
+        for f in found:
+            r.add(f)
+        self._log_last_scan = now
+        self._log_last_findings = [f.to_dict() for f in found]
 
     # workloads
     def check_workloads(self, r: RunResult) -> None:

@@ -19,6 +19,20 @@ data:
   JOB_FAILED_LOOKBACK_HOURS: "24"
   PVC_PENDING_MINUTES: "5"
   LB_PENDING_MINUTES: "10"
+  # Pemindaian log pod Running/Ready yang sebenarnya error (check "logs")
+  LOG_SCAN_WINDOW_MINUTES: "10"
+  LOG_SCAN_INTERVAL_SECONDS: "0"
+  LOG_SCAN_MIN_ERRORS: "5"
+  LOG_SCAN_CRITICAL_ERRORS: "50"
+  LOG_SCAN_TAIL_LINES: "1000"
+  LOG_SCAN_LIMIT_BYTES: "512000"
+  LOG_SCAN_MAX_CONTAINERS: "300"
+  LOG_SCAN_CONCURRENCY: "5"
+  LOG_SCAN_SAMPLE_LINES: "8"
+  LOG_SCAN_NAMESPACES_INCLUDE: ""
+  LOG_SCAN_NAMESPACES_EXCLUDE: ""
+  LOG_SCAN_ERROR_PATTERN: ""
+  LOG_SCAN_IGNORE_PATTERN: ""
   NOTIFY_WEBHOOK_URL: "http://k8s-health-notifier.k8s-health.svc:8080/webhook"
   NOTIFY_RESOLVED: "true"
   REMINDER_INTERVAL_MINUTES: "60"
@@ -69,7 +83,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: checker
-          image: k8s-health-checker:1.1.1
+          image: k8s-health-checker:1.2.0
           imagePullPolicy: IfNotPresent
           # Urutan penting: key di Secret MENIMPA key yang sama di ConfigMap,
           # jadi LLM_PROVIDER/LLM_MODEL/dll. boleh ditaruh di ConfigMap atau di Secret.

@@ -115,7 +115,8 @@ def finding_embed(f: dict, remediation_enabled: bool, llm_status: str = "") -> d
             fields.append({"name": "Detail deteksi", "value": _code(evidence[:6]), "inline": False})
         logs = extra.get("log_excerpt") or []
         if logs:
-            fields.append({"name": "Log terakhir", "value": _code([_cut(x, 200) for x in logs]), "inline": False})
+            label = _cut(extra.get("log_label") or "Log terakhir", 256)
+            fields.append({"name": label, "value": _code([_cut(x, 200) for x in logs]), "inline": False})
         if llm_ok:
             fields += _numbered_fields("Rekomendasi remediasi", analysis.get("remediation") or [])
             cmds = analysis.get("commands") or []
@@ -149,7 +150,8 @@ def finding_embed(f: dict, remediation_enabled: bool, llm_status: str = "") -> d
 
 def _shrink(e: dict, limit: int = MAX_TOTAL) -> dict:
     """Pastikan satu embed muat di batas 6000 karakter Discord."""
-    drop_order = ["Log terakhir", "Perintah", "Detail deteksi", "Perlu dicek lebih lanjut", "Rekomendasi remediasi (lanjutan)"]
+    log_fields = [x["name"] for x in e["fields"] if x["name"].startswith(("Log terakhir", "Baris error di log"))]
+    drop_order = log_fields + ["Perintah", "Detail deteksi", "Perlu dicek lebih lanjut", "Rekomendasi remediasi (lanjutan)"]
     for name in drop_order:
         if _embed_size(e) <= limit:
             break

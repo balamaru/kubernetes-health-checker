@@ -121,6 +121,14 @@ EVENT_REASONS = {
 }
 
 # Event yang sudah tercakup oleh pemeriksaan lain (hindari duplikasi notifikasi)
+LOG_ERRORS_EXPLANATION = (
+    "Pod berstatus Running (bahkan Ready) sehingga terlihat sehat di `kubectl get pods`, tetapi log "
+    "aplikasinya terus mencatat error. Kubernetes hanya memantau proses container dan hasil probe; error "
+    "di level aplikasi (koneksi database/cache gagal, exception per request, timeout ke service lain, "
+    "konfigurasi salah, kredensial kedaluwarsa) tidak mengubah status pod selama prosesnya hidup dan probe "
+    "lolos. Akibatnya sebagian atau seluruh request pengguna bisa gagal tanpa ada pod yang restart."
+)
+
 EVENT_REASONS_COVERED_ELSEWHERE = {"FailedScheduling", "BackOff", "Pulling", "Failed", "NodeNotReady"}
 NETWORK_EVENT_REASONS = {"FailedCreatePodSandBox", "NetworkNotReady", "DNSConfigForming"}
 

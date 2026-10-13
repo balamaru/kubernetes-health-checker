@@ -22,7 +22,7 @@ def lst(items):
 
 
 def pod(ns, name, phase="Running", ready=True, labels=None, statuses=None, conditions=None, owner=None,
-        created=60, status_extra=None, deletion=None, node="node-1", containers=None):
+        created=60, status_extra=None, deletion=None, node="node-1", containers=None, annotations=None):
     conds = conditions if conditions is not None else [
         {"type": "PodScheduled", "status": "True"},
         {"type": "Ready", "status": "True" if ready else "False", "lastTransitionTime": ts(30),
@@ -33,6 +33,8 @@ def pod(ns, name, phase="Running", ready=True, labels=None, statuses=None, condi
         meta["ownerReferences"] = [{"kind": owner, "name": name.rsplit("-", 1)[0]}]
     if deletion:
         meta["deletionTimestamp"] = ts(deletion)
+    if annotations:
+        meta["annotations"] = annotations
     st = {"phase": phase, "conditions": conds, "containerStatuses": statuses or []}
     st.update(status_extra or {})
     spec = {"nodeName": node, "containers": containers or [{"name": "app", "image": "nginx:1.27"}]}
@@ -78,6 +80,17 @@ def scenario() -> dict[str, dict]:
              "message": "0/3 nodes are available: 1 node(s) had untolerated taint {node.kubernetes.io/unreachable: }, 2 Insufficient memory."}],
             created=20, node=None),
         pod("shop", "slow-1", ready=False, labels={"app": "slow"}, statuses=[cs(ready=False)]),
+        # Running & Ready, restart 0 — tetapi log aplikasi penuh error (harus terdeteksi oleh check "logs")
+        pod("shop", "pay-6f7b-k2", labels={"app": "pay", "pod-template-hash": "6f7b"}, owner="ReplicaSet",
+            containers=[{"name": "app", "image": "registry.local/pay:1.4.0",
+                         "readinessProbe": {"tcpSocket": {"port": 8080}, "periodSeconds": 10}}],
+            statuses=[cs()]),
+        pod("shop", "pay-6f7b-k3", labels={"app": "pay", "pod-template-hash": "6f7b"}, owner="ReplicaSet",
+            statuses=[cs()]),
+        # Running & Ready dengan log berisi kata "error" tetapi bukan error (tidak boleh terdeteksi)
+        pod("shop", "chatty-1", statuses=[cs()]),
+        # Opt-out lewat anotasi
+        pod("shop", "optout-1", statuses=[cs()], annotations={"health-checker.io/log-scan": "false"}),
         pod("batch", "ev-1", phase="Failed", status_extra={"reason": "Evicted", "message": "The node was low on resource: memory."}),
         pod("batch", "ev-2", phase="Failed", status_extra={"reason": "Evicted", "message": "The node was low on resource: ephemeral-storage."}),
         pod("kube-system", "coredns-1", ready=False, labels={"k8s-app": "kube-dns"}, statuses=[cs(ready=False)]),
@@ -215,6 +228,17 @@ class FakeK8s:
             "FATAL: java.lang.OutOfMemoryError: Java heap space\n",
         ("shop", "api-5c6d-x1", False): "2026-10-12 starting api v2.3.1\n",
         ("shop", "slow-1", False): "GET /healthz 503 - dependency redis:6379 connection refused\n",
+        ("shop", "pay-6f7b-k2", False): "\n".join(
+            ["2026-10-13T03:00:01Z INFO  GET /healthz 200 1ms"]
+            + [f"2026-10-13T03:00:{i:02d}Z ERROR PaymentGateway: request to https://psp.example/charge timed out after 30000ms (order={1000 + i})"
+               for i in range(12)]
+            + ['{"level":"error","msg":"failed to publish event","err":"dial tcp 10.0.3.7:5672: connect: connection refused"}'] * 3
+            + ["2026-10-13T03:01:00Z ERROR db: password=SuperSecret123 authentication failed for user app",
+               "2026-10-13T03:01:01Z INFO  GET /healthz 200 1ms"]) + "\n",
+        ("shop", "pay-6f7b-k3", False): "2026-10-13T03:00:05Z ERROR PaymentGateway: request to https://psp.example/charge timed out after 30000ms (order=77)\n",
+        ("shop", "chatty-1", False): "processed batch errors=0 retries=0\nlevel=info msg=\"no error\"\n"
+            "GET /api/errors 200\nerror_rate=0.00\n",
+        ("shop", "optout-1", False): "ERROR something\n" * 50,
     }
 
     def resolve(self, sc: dict, path: str, raw: str):

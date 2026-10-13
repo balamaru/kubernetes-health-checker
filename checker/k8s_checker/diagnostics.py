@@ -314,6 +314,30 @@ class DiagnosticsCollector:
         r = f.resource
         kind, ns, name = r.kind, r.namespace, r.name
 
+        if f.check == "pod.log_errors":
+            # Resource = workload; diagnostik diambil dari pod dengan error terbanyak.
+            ctx["log_error_scan"] = {
+                "window_minutes": f.extra.get("window_minutes"),
+                "error_lines_total": f.extra.get("error_count"),
+                "pods_affected": f.extra.get("pods_affected"),
+                "pods_scanned": f.extra.get("pods_scanned"),
+                "all_pods_ready": f.extra.get("ready"),
+                "top_error_signatures": f.extra.get("signatures"),
+                "sample_error_lines": f.extra.get("log_excerpt"),
+            }
+            p = self.find_pod(ns, f.extra.get("pod") or "")
+            if not p:
+                ctx["note"] = "Pod sudah tidak ada saat diagnostik dikumpulkan"
+                return
+            ctx["pod"] = pod_summary(p)
+            ctx["events"] = self.events_for("Pod", _meta(p).get("name"), ns)
+            cname = f.extra.get("container")
+            cur = self.logs(ns, _meta(p).get("name"), cname, previous=False) if cname else None
+            if cur:
+                ctx["logs"] = {cname: {"current": cur}}
+            self._owner_chain(p, ctx)
+            return
+
         if kind == "Pod":
             p = self.find_pod(ns, name)
             if not p:
